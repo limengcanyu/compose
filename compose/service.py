@@ -45,6 +45,7 @@ from .const import LABEL_VERSION
 from .const import NANOCPUS_SCALE
 from .const import WINDOWS_LONGPATH_PREFIX
 from .container import Container
+from .errors import CompletedUnsuccessfully
 from .errors import HealthCheckFailed
 from .errors import NoHealthCheckConfigured
 from .errors import OperationFailedError
@@ -112,6 +113,7 @@ HOST_CONFIG_KEYS = [
 
 CONDITION_STARTED = 'service_started'
 CONDITION_HEALTHY = 'service_healthy'
+CONDITION_COMPLETED_SUCCESSFULLY = 'service_completed_successfully'
 
 
 class BuildError(Exception):
@@ -181,7 +183,6 @@ class Service:
             pid_mode=None,
             default_platform=None,
             extra_labels=None,
-            device_requests=None,
             **options
     ):
         self.name = name
@@ -197,7 +198,6 @@ class Service:
         self.secrets = secrets or []
         self.scale_num = scale
         self.default_platform = default_platform
-        self.device_requests = device_requests
         self.options = options
         self.extra_labels = extra_labels or []
 
@@ -367,6 +367,24 @@ class Service:
             "Image for service {} was built because it did not already exist. To "
             "rebuild this image you must use `docker-compose build` or "
             "`docker-compose up --build`.".format(self.name))
+
+    def must_build(self, do_build=BuildAction.none):
+        if self.can_be_built() and do_build == BuildAction.force:
+            return True
+
+        try:
+            self.image()
+            return False
+        except NoSuchImageError:
+            pass
+
+        if not self.can_be_built():
+            return False
+
+        if do_build == BuildAction.skip:
+            return False
+
+        return True
 
     def get_image_registry_data(self):
         try:
@@ -719,7 +737,7 @@ class Service:
             'volumes_from': [
                 (v.source.name, v.mode)
                 for v in self.volumes_from if isinstance(v.source, Service)
-            ],
+            ]
         }
 
     def get_dependency_names(self):
@@ -755,6 +773,8 @@ class Service:
                 configs[svc] = lambda s: True
             elif config['condition'] == CONDITION_HEALTHY:
                 configs[svc] = lambda s: s.is_healthy()
+            elif config['condition'] == CONDITION_COMPLETED_SUCCESSFULLY:
+                configs[svc] = lambda s: s.is_completed_successfully()
             else:
                 # The config schema already prevents this, but it might be
                 # bypassed if Compose is called programmatically.
@@ -1019,7 +1039,7 @@ class Service:
             privileged=options.get('privileged', False),
             network_mode=self.network_mode.mode,
             devices=options.get('devices'),
-            device_requests=self.device_requests,
+            device_requests=options.get('device_requests'),
             dns=options.get('dns'),
             dns_opt=options.get('dns_opt'),
             dns_search=options.get('dns_search'),
@@ -1306,6 +1326,21 @@ class Service:
                 raise HealthCheckFailed(ctnr.short_id)
         return result
 
+    def is_completed_successfully(self):
+        """ Check that all containers for this service has completed successfully
+            Returns false if at least one container does not exited and
+            raises CompletedUnsuccessfully exception if at least one container
+            exited with non-zero exit code.
+        """
+        result = True
+        for ctnr in self.containers(stopped=True):
+            ctnr.inspect()
+            if ctnr.get('State.Status') != 'exited':
+                result = False
+            elif ctnr.exit_code != 0:
+                raise CompletedUnsuccessfully(ctnr.short_id, ctnr.exit_code)
+        return result
+
     def _parse_proxy_config(self):
         client = self.client
         if 'proxies' not in client._general_configs:
@@ -1330,6 +1365,24 @@ class Service:
             result[permitted[k]] = result[permitted[k].lower()] = v
 
         return result
+
+    def get_profiles(self):
+        if 'profiles' not in self.options:
+            return []
+
+        return self.options.get('profiles')
+
+    def enabled_for_profiles(self, enabled_profiles):
+        # if service has no profiles specified it is always enabled
+        if 'profiles' not in self.options:
+            return True
+
+        service_profiles = self.options.get('profiles')
+        for profile in enabled_profiles:
+            if profile in service_profiles:
+                return True
+
+        return False
 
 
 def short_id_alias_exists(container, network):
@@ -1839,7 +1892,7 @@ class _CLIBuilder:
         Returns:
             A generator for the build output.
         """
-        if dockerfile:
+        if dockerfile and os.path.isdir(path):
             dockerfile = os.path.join(path, dockerfile)
         iidfile = tempfile.mktemp()
 
@@ -1857,6 +1910,15 @@ class _CLIBuilder:
         command_builder.add_arg("--tag", tag)
         command_builder.add_arg("--target", target)
         command_builder.add_arg("--iidfile", iidfile)
+        command_builder.add_arg("--platform", platform)
+        command_builder.add_arg("--isolation", isolation)
+
+        if extra_hosts:
+            if isinstance(extra_hosts, dict):
+                extra_hosts = ["{}:{}".format(host, ip) for host, ip in extra_hosts.items()]
+            for host in extra_hosts:
+                command_builder.add_arg("--add-host", "{}".format(host))
+
         args = command_builder.build([path])
 
         magic_word = "Successfully built "

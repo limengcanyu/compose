@@ -54,9 +54,10 @@ class Environment(dict):
             if base_dir is None:
                 return result
             if env_file:
-                env_file_path = os.path.join(base_dir, env_file)
-            else:
-                env_file_path = os.path.join(base_dir, '.env')
+                env_file_path = os.path.join(os.getcwd(), env_file)
+                return cls(env_vars_from_file(env_file_path))
+
+            env_file_path = os.path.join(base_dir, '.env')
             try:
                 return cls(env_vars_from_file(env_file_path))
             except EnvFileNotFound:
@@ -113,13 +114,13 @@ class Environment(dict):
             )
         return super().get(key, *args, **kwargs)
 
-    def get_boolean(self, key):
+    def get_boolean(self, key, default=False):
         # Convert a value to a boolean using "common sense" rules.
         # Unset, empty, "0" and "false" (i-case) yield False.
         # All other values yield True.
         value = self.get(key)
         if not value:
-            return False
+            return default
         if value.lower() in ['0', 'false']:
             return False
         return True
